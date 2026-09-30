@@ -238,6 +238,32 @@ def approval_items(text: str, limit: int = 8) -> list[tuple[str, str, str]]:
     return items[:limit]
 
 
+def approval_brief(text: str) -> str:
+    """답변에 붙일 전결 판단 한 줄. 계약 관련 질문이 아니면 빈 문자열."""
+    ctx = _context(text)
+    flags, amount = ctx["flags"], ctx["amount"]
+    if "contract" not in flags:
+        return ""
+    if not amount:
+        return "💼 **전결** 계약총액 확인 후 전결권자 결정 (금액 구간은 체크리스트 참고)"
+
+    total = amount["total"]
+    who, _ = authority_for(total)
+    if "sole" in flags:
+        method = "수의계약 사유서 필요"
+    elif total <= 5_000_000:
+        method = "1개 이상 견적"
+    elif total <= 30_000_000:
+        method = "2개 이상 비교견적"
+    else:
+        method = "3개 이상 업체 경쟁"
+    basis = f" = {amount['basis']}" if amount["basis"] else ""
+    parts = [f"본사 **{who}**", f"계약총액 {format_won(total)}{basis}", method]
+    if total > 30_000_000:
+        parts.append(f"이행보증 {format_won(total // 10)}")
+    return "💼 **전결** " + " · ".join(parts)
+
+
 def approval_summary(text: str) -> str:
     """답변에 붙일 전결 판단 요약. 계약 관련 질문이 아니면 빈 문자열."""
     ctx = _context(text)

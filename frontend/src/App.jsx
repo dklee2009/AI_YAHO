@@ -1,7 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import "./App.css";
 
-const API_URL = "http://localhost:8001";
+// 배포 시에는 빌드 환경변수 VITE_API_URL(예: https://ai-yaho-api.onrender.com)로 백엔드 주소를 넣는다.
+const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:8001").replace(/\/+$/, "");
 
 const MODELS = [
   { id: "claude-sonnet-5", label: "Claude Sonnet 5" },

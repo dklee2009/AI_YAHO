@@ -13,15 +13,20 @@ from dotenv import load_dotenv
 from law_scraper import find_relevant_articles, get_law_summary
 from owner_matcher import EMPLOYEES, assign_owner, infer_area
 from checklist_docx import build_checklist_docx
-from approval_rules import approval_items, approval_summary
+from approval_rules import approval_brief, approval_items, approval_summary
 
 load_dotenv()
 
 app = FastAPI(title="AI Agent Chat API")
 
+# 로컬 개발 주소 + 배포 시 ALLOWED_ORIGINS(쉼표 구분, 예: https://ai-yaho-web.onrender.com)
+ALLOWED_ORIGINS = ["http://localhost:5173", "http://localhost:3000"] + [
+    o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -51,34 +56,47 @@ TOPICS = {
 }
 
 ASSISTANT_SYSTEM_PROMPT = """당신은 NH농협은행 IT본부의 AI 어시스턴트입니다.
-사용자가 제시하는 IT 프로젝트나 서비스 아이디어를 다음 관점에서 종합적으로 검토합니다:
-- 플랫폼/시스템: 아키텍처, API, 인프라, 기술 구현
-- 보안: 취약점, 암호화, 위협 대응
-- 규정/컴플라이언스: 금융 규제, 개인정보보호법, 사내 정책
-- 인증/권한: 로그인, 세션, 접근 제어
+사용자가 제시하는 IT 프로젝트나 서비스 아이디어를 플랫폼·보안·규정·인증 관점에서 검토합니다.
 
-질문과 관련 있는 관점들을 종합해서 실용적이고 명확한 하나의 답변으로 정리해 주세요.
+답변은 핵심 요약만 짧게 작성하세요:
+- 첫 줄은 "**핵심 요약**"
+- 질문과 관련 있는 관점만 3~5개 글머리표로, 각 1문장(60자 안팎)
+- 관련 법령이나 전결 판단이 있으면 "📚 **관련 법령**", "💼 **전결**"로 각각 한 줄만 덧붙임
+- 서론·맺음말·같은 내용 반복·긴 설명은 쓰지 않음 (전체 400자 이내)
 한국어로 응답하세요."""
 
-MOCK_RESPONSES = {
+# 주제 라벨과 mock 모드 한 줄 요약 후보 (매번 하나씩 무작위로 고른다)
+TOPIC_LABELS = {"platform": "플랫폼", "security": "보안", "regulation": "규정", "auth": "인증"}
+MOCK_SUMMARIES = {
     "platform": [
-        "플랫폼 관점에서 검토했습니다.\n\n현재 구조에서는 **API Gateway**를 통한 요청 라우팅이 적합하며, 마이크로서비스 아키텍처 적용 시 서비스 간 통신은 gRPC 또는 REST를 상황에 맞게 선택해야 합니다.\n\n구체적인 구현 방향:\n- 서비스 디스커버리: Kubernetes + Istio\n- 모니터링: Prometheus + Grafana\n- CI/CD: GitLab Pipeline\n\n추가 요건이 있으시면 말씀해 주세요.",
-        "시스템 통합 측면에서 말씀드리겠습니다.\n\n기존 레거시 시스템과의 연동은 **Anti-Corruption Layer(ACL)** 패턴을 활용하는 것을 권장합니다. 신규 플랫폼과 기존 시스템 간의 데이터 변환 로직을 분리하면 추후 마이그레이션이 용이합니다.\n\n단계적 전환 계획을 수립하여 진행하는 것이 안전합니다.",
-        "해당 질문에 대해 플랫폼솔루션 관점에서 답변드립니다.\n\n현재 NH농협은행 IT 환경에서는 **온프레미스 + 하이브리드 클라우드** 구성이 기본입니다. 신규 서비스 개발 시 클라우드 네이티브 설계를 우선 적용하되, 금융 규제 요건을 충족하는 범위 내에서 진행해야 합니다.",
+        "API Gateway로 라우팅하고, 레거시 연동은 ACL 패턴으로 분리해 단계적으로 전환하세요.",
+        "온프레미스+하이브리드 클라우드 기준으로, 규제 범위 안에서 클라우드 네이티브로 설계하세요.",
+        "Kubernetes 기반 배포에 Prometheus·Grafana 모니터링, CI/CD 파이프라인을 갖추세요.",
     ],
     "security": [
-        "보안 관점에서 중요한 사항들을 짚어드리겠습니다.\n\n1. **전송 구간 암호화**: TLS 1.3 이상 필수 적용\n2. **최소 권한 원칙**: 각 서비스에 필요한 최소한의 접근 권한만 부여\n3. **입력값 검증**: SQL Injection, XSS 등 OWASP Top 10 대응\n4. **로그 관리**: 접근 로그 180일 이상 보관 (금융보안원 기준)\n\n정기적인 취약점 점검과 침투 테스트도 필수입니다.",
-        "보안 위협 분석 결과를 공유합니다.\n\n현재 설계에서 주의해야 할 부분은 **세션 하이재킹** 방지입니다. HTTPS Only, Secure/HttpOnly 쿠키 설정, CSRF Token 적용이 기본입니다.\n\n또한 민감 정보(주민번호, 계좌번호)는 저장 시 AES-256 암호화를 적용해야 하며, 키 관리는 HSM(Hardware Security Module)을 통해 별도로 관리해야 합니다.",
+        "TLS 1.3, 최소 권한, OWASP Top 10 대응, 접근 로그 180일 보관이 기본입니다.",
+        "민감정보는 AES-256 암호화·HSM 키 관리, 세션은 Secure/HttpOnly 쿠키와 CSRF 토큰으로 보호하세요.",
     ],
     "regulation": [
-        "규정 측면에서 검토하겠습니다.\n\n해당 사항은 **전자금융감독규정 제15조**와 **개인정보보호법 제29조**에 해당합니다.\n\n진행 전 필수 확인 사항:\n- 준법감시팀 사전 검토 및 승인\n- IT컴플라이언스 자가점검 체크리스트 완료\n- 변경 이력 관리 시스템 등록\n\n금융위원회 감독 기준 변경이 있을 수 있으니 최신 고시를 확인해 주세요.",
-        "IT 규정 준수 관점에서 안내드립니다.\n\n**전자금융거래법** 및 **정보통신망법**에 따라 다음 절차가 필요합니다:\n\n1. 위험평가 실시 (분기 1회)\n2. 정보보호 관리체계(ISMS) 심사 대응\n3. 내부 통제 기준 적용 여부 확인\n\n세부 기준은 내부 IT컴플라이언스 지침을 참조하시고, 불명확한 부분은 준법감시팀에 문의 주세요.",
+        "전자금융감독규정·개인정보보호법 적용 대상이라 준법감시팀 사전 검토가 필요합니다.",
+        "위험평가·ISMS 대응·내부통제 기준 확인 후 진행하세요.",
     ],
     "auth": [
-        "인증 체계 관점에서 말씀드리겠습니다.\n\n**권장 구조:**\n```\nAccess Token:  JWT (유효기간 1시간)\nRefresh Token: Opaque Token (유효기간 7일, DB 저장)\n```\n\n토큰 재발급 시 Refresh Token Rotation 적용을 권장합니다. 탈취 시 즉시 무효화가 가능하도록 Redis 기반 블랙리스트 관리도 고려해 주세요.\n\nMFA(다중인증)는 관리자 계정 및 고위험 거래에 필수 적용이 필요합니다.",
-        "SSO(Single Sign-On) 구현 방안입니다.\n\nOAuth 2.0 + OIDC 기반으로 구성하되, NH 내부 시스템과의 연동은 **SAML 2.0** 프로토콜도 검토가 필요합니다.\n\n공인인증서 연동의 경우 전자서명법 개정(2021)에 따라 민간 인증서(PASS, 카카오 등) 병행 사용이 가능합니다. 내부 정책 확인 후 적용 범위를 결정해 주세요.",
+        "JWT(1시간)+Refresh Token(7일, Rotation) 구조에 고위험 거래는 MFA를 적용하세요.",
+        "OAuth 2.0+OIDC 기반 SSO로 구성하고, 내부 연동은 SAML 2.0도 검토하세요.",
     ],
 }
+
+
+def law_brief(law_context: str) -> str:
+    """법령 조문 전문 대신 법령별 조문 번호만 한 줄로 줄인다.
+    예: 📚 관련 법령 전자금융거래법 제21조·제9조, 개인정보보호법 제29조"""
+    by_law: dict[str, list[str]] = {}
+    for law, article in re.findall(r"▸ \*\*(.+?)\s+(제\d+조(?:의\d+)?)\*\*", law_context):
+        by_law.setdefault(law, []).append(article)
+    if not by_law:
+        return ""
+    return "📚 **관련 법령** " + ", ".join(f"{law} {'·'.join(arts)}" for law, arts in by_law.items())
 
 
 # 체크리스트 카테고리. 지금은 두 개로 시작하지만 이후 계속 추가될 예정이라
@@ -286,12 +304,10 @@ async def mock_agent_stream(question: str):
     yield f"data: {json.dumps({'type': 'answer_start'})}\n\n"
     await asyncio.sleep(0.2)
 
-    reply = "\n\n".join(random.choice(MOCK_RESPONSES[t]) for t in topics)
-    if law_context:
-        reply = law_context + "\n\n---\n\n" + reply
-    approval_text = approval_summary(question)
-    if approval_text:
-        reply += "\n\n---\n\n" + approval_text
+    lines = ["**핵심 요약**"]
+    lines += [f"- **{TOPIC_LABELS[t]}** {random.choice(MOCK_SUMMARIES[t])}" for t in topics]
+    extras = [law_brief(law_context), approval_brief(question)]
+    reply = "\n".join(lines) + "".join(f"\n\n{e}" for e in extras if e)
 
     for char in reply:
         yield f"data: {json.dumps({'type': 'text', 'text': char})}\n\n"
@@ -323,7 +339,7 @@ async def real_agent_stream(messages: list[dict], model: str):
     system_prompt = ASSISTANT_SYSTEM_PROMPT
     if law_context:
         system_prompt += (
-            "\n\n다음은 관련 법령 조문입니다. 필요한 경우 답변에 인용하여 근거를 명확히 제시하세요:\n\n"
+            "\n\n다음은 관련 법령 조문입니다. 조문 내용을 옮겨 적지 말고 📚 **관련 법령** 한 줄에 조문 번호만 적으세요:\n\n"
             + law_context
         )
 
@@ -331,7 +347,7 @@ async def real_agent_stream(messages: list[dict], model: str):
     if approval_text:
         system_prompt += (
             "\n\n다음은 사내 전결기준표·계약업무준칙에 따라 규칙으로 판단한 결과입니다. "
-            "금액·전결권자는 이 내용을 그대로 따르고 답변 끝에 요약해 주세요:\n\n" + approval_text
+            "금액·전결권자는 이 내용을 그대로 따르고 답변 끝에 💼 **전결** 한 줄로만 요약하세요:\n\n" + approval_text
         )
 
     yield f"data: {json.dumps({'type': 'answer_start'})}\n\n"
@@ -339,7 +355,7 @@ async def real_agent_stream(messages: list[dict], model: str):
     collected = []
     try:
         with client.messages.stream(
-            model=model, max_tokens=2000,
+            model=model, max_tokens=700,
             system=system_prompt, messages=messages,
         ) as stream:
             for text in stream.text_stream:
