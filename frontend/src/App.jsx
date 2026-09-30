@@ -14,15 +14,36 @@ const MODELS = [
 const CATEGORY_THEME = {
   security: { accent: "#B91C1C", dot: "#EF4444" },
   it:       { accent: "#1D4ED8", dot: "#3B82F6" },
+  approval: { accent: "#B45309", dot: "#F59E0B" },
 };
 const CATEGORY_THEME_FALLBACK = { accent: "#475569", dot: "#94A3B8" };
 
-// 체크리스트 시작 카테고리 (보안 / IT). 백엔드 CATEGORY_LABELS와 id·제목을 맞춤.
+// 체크리스트 시작 카테고리 (보안 / IT / 전결). 백엔드 CATEGORY_LABELS와 id·제목을 맞춤.
 const SEED_CATEGORIES = [
   { id: "security", title: "보안 (개인정보보호·정보보안 법/규정)", items: [] },
   { id: "it",       title: "IT (서비스 구현 체크리스트)",          items: [] },
+  { id: "approval", title: "전결 (전결기준표·계약업무준칙)",       items: [] },
 ];
 const CATEGORY_LABEL_BY_ID = Object.fromEntries(SEED_CATEGORIES.map(c => [c.id, c.title]));
+
+// 체크리스트 표의 번호 접두어 (S-01, I-01 …). 새 카테고리는 id 첫 글자를 쓴다.
+const CATEGORY_PREFIX = { security: "S", it: "I", approval: "A" };
+const itemNo = (catId, index) =>
+  `${CATEGORY_PREFIX[catId] || catId.charAt(0).toUpperCase()}-${String(index + 1).padStart(2, "0")}`;
+
+const ownerLabel = (o) => (o ? `${o.name} ${o.title}` : "미지정");
+const ownerOrg   = (o) => (o ? [o.dept, o.team].filter(Boolean).join(" / ") : "-");
+
+// 빈 대화 화면에 보여줄 예시 질문. 첫 질문은 프로젝트 기획으로 판별돼야 답변이 나오므로
+// 모두 '도입/구축/추진/기획' 같은 표현을 넣었고, 규정·인증·플랫폼·전결 흐름을 골고루 타도록 골랐다.
+const EXAMPLE_QUESTIONS = [
+  { tag: "규정·법령", text: "고객 거래 데이터를 활용한 맞춤형 대출 추천 서비스를 도입하려고 합니다. 개인정보보호법과 전자금융 규정 준수 관점에서 검토해 주세요." },
+  { tag: "인증·보안", text: "모바일 뱅킹 앱에 생체인증 로그인과 SSO를 구축하는 프로젝트를 기획 중입니다. 토큰 관리와 보안 위협 대응 방안을 알려주세요." },
+  { tag: "플랫폼",   text: "레거시 계정계 시스템을 클라우드 기반 마이크로서비스로 전환하는 사업을 추진하려 합니다. 아키텍처와 API 연동 방향을 검토해 주세요." },
+  { tag: "종합",     text: "농업인 대상 비대면 대출 플랫폼을 신규 구축하려고 합니다. 시스템 구성, 본인인증, 개인정보 암호화, 금융 규제 측면을 종합적으로 검토해 주세요." },
+  { tag: "전결·계약", text: "그룹웨어 유지보수 용역을 연간 4천만원(부가세 포함)으로 3년간 외부 업체와 계약해 도입하려고 합니다. 전결권자와 계약 절차를 검토해 주세요." },
+  { tag: "수의계약", text: "기존 계정계 장비와 호환되는 스토리지를 2천5백만원에 기존 업체와 수의계약으로 긴급 도입하려고 합니다. 필요한 승인 절차를 알려주세요." },
+];
 
 function formatText(text) {
   const parts = text.split(/(```[\s\S]*?```)/g);
@@ -127,7 +148,15 @@ function IssueSuggestion({ group, added, onAdd }) {
                     disabled={added}
                     style={{ accentColor: theme.accent }}
                   />
-                  <span>{it.text}</span>
+                  <span className="issue-check-body">
+                    <span>
+                      {it.area && <span className="issue-area" style={{ color: theme.accent }}>{it.area}</span>}
+                      {it.text}
+                    </span>
+                    {it.owner && (
+                      <span className="issue-owner">담당 {ownerLabel(it.owner)} · {ownerOrg(it.owner)}</span>
+                    )}
+                  </span>
                 </label>
               </li>
             ))}
@@ -144,7 +173,7 @@ function IssueSuggestion({ group, added, onAdd }) {
 // checked_categories를 보안 → IT 순으로 정렬해 슬롯을 만들고, 실제로 이슈가
 // 있는 카테고리는 항목을 채우고 없는 카테고리는 빈 슬롯(= "이슈 없음" 카드)으로 둔다.
 // 한 번에 다 보여주지 않고 카테고리별로 순차적으로 물어보기 위한 큐를 만든다.
-const ISSUE_CATEGORY_ORDER = ["it", "security"];
+const ISSUE_CATEGORY_ORDER = ["it", "security", "approval"];
 function groupIssuesByCategory(items, checkedCategories) {
   const byCategory = new Map();
   for (const it of items) {
@@ -194,7 +223,7 @@ function buildHistory(messages) {
   return history;
 }
 
-function DocumentPreview({ categories }) {
+function DocumentPreview({ categories, onToggle }) {
   const visible = categories.filter(c => c.items.length > 0);
   return (
     <div className="doc-preview">
@@ -206,13 +235,34 @@ function DocumentPreview({ categories }) {
         {visible.map(cat => (
           <div key={cat.id} className="doc-section">
             <h3>{cat.title}</h3>
-            <ul>
-              {cat.items.map(item => (
-                <li key={item.id} className={item.done ? "doc-item-done" : ""}>
-                  <span className="doc-check">{item.done ? "☑" : "☐"}</span> {item.text}
-                </li>
-              ))}
-            </ul>
+            <table className="doc-table">
+              <colgroup>
+                <col style={{ width: "6%" }} /><col style={{ width: "7%" }} /><col style={{ width: "11%" }} />
+                <col style={{ width: "30%" }} /><col style={{ width: "19%" }} /><col style={{ width: "12%" }} />
+                <col style={{ width: "15%" }} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>선택</th><th>번호</th><th>검토 분야</th><th>체크리스트</th>
+                  <th>확인 필요사항</th><th>담당자</th><th>소속</th>
+                </tr>
+              </thead>
+              <tbody>
+                {cat.items.map((item, idx) => (
+                  <tr key={item.id} className={item.done ? "doc-row-done" : ""}>
+                    <td className="c">
+                      <input type="checkbox" checked={item.done} onChange={() => onToggle(cat.id, item.id)} />
+                    </td>
+                    <td className="c doc-no">{itemNo(cat.id, idx)}</td>
+                    <td className="c">{item.area || "-"}</td>
+                    <td>{item.text}</td>
+                    <td>{item.check || "-"}</td>
+                    <td className="c doc-owner">{ownerLabel(item.owner)}</td>
+                    <td>{ownerOrg(item.owner)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         ))}
       </div>
@@ -220,7 +270,28 @@ function DocumentPreview({ categories }) {
   );
 }
 
-function SidePanel({ categories, onToggle, onAddManual, onDelete, onClose }) {
+// 담당자 표시 + 후보가 여러 명이면 드롭다운으로 바꿀 수 있게 한다.
+function OwnerSelect({ item, onChange }) {
+  const candidates = item.candidates || [];
+  if (item.ownerPending) return <span className="cl-item-owner">담당자 판단 중…</span>;
+  if (candidates.length <= 1) {
+    return <span className="cl-item-owner" title={ownerOrg(item.owner)}>👤 {ownerLabel(item.owner)}</span>;
+  }
+  return (
+    <select
+      className="cl-owner-select"
+      value={item.owner?.emp_no || ""}
+      title={ownerOrg(item.owner)}
+      onChange={e => onChange(candidates.find(c => c.emp_no === e.target.value))}
+    >
+      {candidates.map(c => (
+        <option key={c.emp_no} value={c.emp_no}>👤 {c.name} {c.title} · {c.team} ({c.duty})</option>
+      ))}
+    </select>
+  );
+}
+
+function SidePanel({ categories, onToggle, onAddManual, onDelete, onChangeOwner, onClose }) {
   const [tab, setTab] = useState("checklist"); // "checklist" | "preview"
   const [newTexts, setNewTexts] = useState({});
   const [downloading, setDownloading] = useState(false);
@@ -245,7 +316,10 @@ function SidePanel({ categories, onToggle, onAddManual, onDelete, onClose }) {
         body: JSON.stringify({
           categories: categories.map(c => ({
             id: c.id, title: c.title,
-            items: c.items.map(i => ({ id: i.id, text: i.text, done: i.done })),
+            items: c.items.map((i, idx) => ({
+              id: i.id, text: i.text, done: i.done, no: itemNo(c.id, idx),
+              area: i.area || "", check: i.check || "", owner: i.owner || null,
+            })),
           })),
         }),
       });
@@ -312,17 +386,26 @@ function SidePanel({ categories, onToggle, onAddManual, onDelete, onClose }) {
                   {cat.items.length === 0 && (
                     <p className="cl-empty-hint">아직 항목이 없어요</p>
                   )}
-                  {cat.items.map(item => (
+                  {cat.items.map((item, idx) => (
                     <div key={item.id} className={`cl-item ${item.done ? "cl-done" : ""}`}>
-                      <label className="cl-item-label">
-                        <input
-                          type="checkbox"
-                          checked={item.done}
-                          onChange={() => onToggle(cat.id, item.id)}
-                          style={{ accentColor: theme.accent }}
-                        />
-                        <span className="cl-item-text">{item.text}</span>
-                      </label>
+                      <div className="cl-item-main">
+                        <label className="cl-item-label">
+                          <input
+                            type="checkbox"
+                            checked={item.done}
+                            onChange={() => onToggle(cat.id, item.id)}
+                            style={{ accentColor: theme.accent }}
+                          />
+                          <span className="cl-item-text">
+                            <span className="cl-item-no" style={{ color: theme.accent }}>{itemNo(cat.id, idx)}</span>
+                            {item.text}
+                          </span>
+                        </label>
+                        <div className="cl-item-meta">
+                          {item.area && <span className="cl-item-area">{item.area}</span>}
+                          <OwnerSelect item={item} onChange={emp => onChangeOwner(cat.id, item.id, emp)} />
+                        </div>
+                      </div>
                       <button
                         className="cl-item-del"
                         onClick={() => onDelete(cat.id, item.id)}
@@ -352,7 +435,7 @@ function SidePanel({ categories, onToggle, onAddManual, onDelete, onClose }) {
           })}
         </div>
       ) : (
-        <DocumentPreview categories={categories} />
+        <DocumentPreview categories={categories} onToggle={onToggle} />
       )}
 
       <div className="cl-footer">
@@ -410,16 +493,43 @@ export default function App() {
     ));
   }, []);
 
-  const addManualItem = useCallback((catId, text) => {
+  const patchItem = useCallback((catId, itemId, patch) => {
     setCategories(prev => prev.map(c =>
       c.id !== catId ? c : {
-        ...c, items: [...c.items, { id: `${catId}_${Date.now()}`, text, done: false }]
+        ...c, items: c.items.map(i => i.id === itemId ? { ...i, ...patch } : i)
       }
     ));
   }, []);
 
-  // AI가 제안한 이슈들을 카테고리별로 체크리스트에 추가. 없는 카테고리는 새로 만든다
-  // (지금은 보안/IT 두 개뿐이지만 이후 카테고리가 늘어나도 그대로 동작).
+  // 직접 추가한 항목은 먼저 목록에 넣고, 검토 분야·담당자는 인사파일 기준으로 서버가 판단해 채운다.
+  const addManualItem = useCallback(async (catId, text) => {
+    const itemId = `${catId}_${Date.now()}`;
+    setCategories(prev => prev.map(c =>
+      c.id !== catId ? c : {
+        ...c, items: [...c.items, { id: itemId, text, done: false, area: "", check: "", owner: null, candidates: [], ownerPending: true }]
+      }
+    ));
+    try {
+      const res = await fetch(`${API_URL}/assign-owner`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, category_id: catId }),
+      });
+      if (!res.ok) throw new Error(res.statusText);
+      const data = await res.json();
+      patchItem(catId, itemId, { area: data.area, owner: data.owner, candidates: data.candidates, ownerPending: false });
+    } catch {
+      patchItem(catId, itemId, { ownerPending: false });
+    }
+  }, [patchItem]);
+
+  const changeOwner = useCallback((catId, itemId, owner) => {
+    if (owner) patchItem(catId, itemId, { owner });
+  }, [patchItem]);
+
+  // AI가 제안한 이슈들을 카테고리별로 체크리스트에 추가. 없는 카테고리는 새로 만든다.
+  // 전결 항목처럼 규칙으로 매번 같은 문장이 나오는 경우를 위해, 같은 카테고리에
+  // 같은 점검 문장이 이미 있으면 건너뛴다(먼저 추가된 항목과 그 확인 필요사항을 유지).
   const addIssuesToChecklist = useCallback((items) => {
     setCategories(prev => {
       const next = prev.map(c => ({ ...c, items: [...c.items] }));
@@ -429,7 +539,13 @@ export default function App() {
           cat = { id: issue.category_id, title: issue.category_label || issue.category_id, items: [] };
           next.push(cat);
         }
-        cat.items.push({ id: issue.id, text: issue.text, done: false });
+        const duplicate = cat.items.some(i => i.text === issue.text);
+        if (duplicate) continue;
+        cat.items.push({
+          id: issue.id, text: issue.text, done: false,
+          area: issue.area || "", check: issue.check || "",
+          owner: issue.owner || null, candidates: issue.candidates || [],
+        });
       }
       return next;
     });
@@ -470,8 +586,8 @@ export default function App() {
     });
   };
 
-  const send = async () => {
-    const text = input.trim();
+  const send = async (overrideText) => {
+    const text = (overrideText ?? input).trim();
     if (!text || loading) return;
 
     const userMsgId   = uid();
@@ -652,6 +768,14 @@ export default function App() {
               <div className="empty-icon">🤖</div>
               <p className="empty-title">IT 프로젝트나 사업 아이디어를 알려주세요</p>
               <p className="empty-sub">플랫폼·보안·규정·인증을 종합적으로 검토해 드려요</p>
+              <div className="example-list">
+                {EXAMPLE_QUESTIONS.map(q => (
+                  <button key={q.tag} className="example-btn" onClick={() => send(q.text)} disabled={loading}>
+                    <span className="example-tag">{q.tag}</span>
+                    <span className="example-text">{q.text}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           ) : (
             activeConv.messages.map((msg) => (
@@ -677,7 +801,7 @@ export default function App() {
               rows={1}
               disabled={loading}
             />
-            <button className={`send-btn ${loading ? "loading" : ""}`} onClick={send} disabled={!input.trim() || loading}>
+            <button className={`send-btn ${loading ? "loading" : ""}`} onClick={() => send()} disabled={!input.trim() || loading}>
               {loading
                 ? <span className="spinner" />
                 : <svg width="17" height="17" viewBox="0 0 24 24" fill="none">
@@ -697,6 +821,7 @@ export default function App() {
           onToggle={toggleChecklistItem}
           onAddManual={addManualItem}
           onDelete={deleteChecklistItem}
+          onChangeOwner={changeOwner}
           onClose={() => setChecklistOpen(false)}
         />
       )}

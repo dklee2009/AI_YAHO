@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import asyncio
 import random
@@ -10,9 +9,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
-from docx import Document
 from dotenv import load_dotenv
 from law_scraper import find_relevant_articles, get_law_summary
+from owner_matcher import EMPLOYEES, assign_owner, infer_area
+from checklist_docx import build_checklist_docx
+from approval_rules import approval_items, approval_summary
 
 load_dotenv()
 
@@ -85,28 +86,46 @@ MOCK_RESPONSES = {
 CATEGORY_LABELS = {
     "security": "보안 (개인정보보호·정보보안 법/규정)",
     "it": "IT (서비스 구현 체크리스트)",
+    "approval": "전결 (전결기준표·계약업무준칙)",
 }
 
-# Mock 모드 이슈 후보. 카테고리별로 묶어두고 매번 두 카테고리 모두에서 뽑아
-# 질문 내용(topics)과 무관하게 항상 IT/보안 두 카드가 다 나오도록 보장한다.
+AI_EXTRACTED_CATEGORIES = {"security", "it"}
+
+# Mock 모드 이슈 후보. 체크리스트 표의 한 줄(검토 분야 / 점검 질문 / 확인 필요사항)
+# 형태로 묶어 두었다. 담당자는 인사파일에서 자동으로 고른다.
 MOCK_ISSUES_BY_CATEGORY = {
     "it": [
-        "API Gateway 트래픽 급증 대비 Rate Limiting 정책 수립 필요",
-        "레거시 시스템 연동 시 데이터 정합성 검증 절차 필요",
-        "마이크로서비스 장애 전파 방지(Circuit Breaker) 설계 필요",
-        "전송 구간 TLS 1.3 이상 적용 여부 확인 필요",
-        "MFA(다중인증) 적용 대상 계정 범위 확정 필요",
-        "Refresh Token Rotation 및 탈취 대응 방안 수립 필요",
+        ("트래픽 관리", "API Gateway 트래픽 급증에 대비한 Rate Limiting 정책이 수립되었는가?", "호출 한도, 초과 시 처리 방식"),
+        ("데이터 정합성", "레거시 시스템 연동 시 데이터 정합성 검증 절차가 마련되었는가?", "검증 대상 데이터, 대사 주기"),
+        ("장애 대응", "마이크로서비스 장애 전파를 막는 Circuit Breaker가 설계되었는가?", "차단 임계치, 복구 절차"),
+        ("전송 암호화", "전송 구간에 TLS 1.3 이상이 적용되었는가?", "적용 구간, 인증서 관리 주체"),
+        ("다중 인증", "MFA(다중인증) 적용 대상 계정 범위가 확정되었는가?", "대상 계정 목록, 인증 수단"),
+        ("토큰 관리", "Refresh Token Rotation과 토큰 탈취 대응 방안이 수립되었는가?", "토큰 유효기간, 폐기 절차"),
     ],
     "security": [
-        "민감정보(주민번호·계좌번호) 저장 시 AES-256 암호화 적용 필요",
-        "접근 로그 180일 이상 보관 정책 수립 필요 (금융보안원 기준)",
-        "개인정보보호법 제29조 안전조치 의무 이행 여부 확인 필요",
-        "전자금융감독규정에 따른 준법감시팀 사전 검토·승인 필요",
-        "변경 이력 관리시스템 등록 여부 확인 필요",
-        "공인/민간 인증서 병행 정책의 법적 근거 확인 필요",
+        ("개인정보 암호화", "민감정보(주민번호·계좌번호) 저장 시 AES-256 암호화가 적용되었는가?", "암호화 대상 항목, 키 관리 방식"),
+        ("로그 보관", "접근 로그를 180일 이상 보관하는 정책이 수립되었는가? (금융보안원 기준)", "보관 기간, 저장 위치"),
+        ("안전조치 의무", "개인정보보호법 제29조 안전조치 의무를 이행하였는가?", "내부관리계획, 점검 결과"),
+        ("준법 검토", "전자금융감독규정에 따른 준법감시팀 사전 검토·승인을 받았는가?", "검토 요청서, 승인 일자"),
+        ("변경 관리", "변경 이력 관리시스템에 등록되었는가?", "등록 번호, 변경 요청자"),
+        ("인증서 정책", "공인/민간 인증서 병행 정책의 법적 근거가 확인되었는가?", "근거 법령, 적용 범위"),
     ],
 }
+
+
+def make_issue(category_id: str, text: str, area: str = "", check: str = "") -> dict:
+    """체크리스트 한 줄 데이터를 만들고 인사파일 기준으로 담당자를 붙인다."""
+    matched = assign_owner(f"{text} {check}", category_id, area)
+    return {
+        "id": uuid.uuid4().hex,
+        "text": text,
+        "area": area or infer_area(text),
+        "check": check,
+        "category_id": category_id,
+        "category_label": CATEGORY_LABELS.get(category_id, category_id),
+        "owner": matched["owner"],
+        "candidates": matched["candidates"],
+    }
 
 
 # 질문 문장 자체에 카테고리별 키워드가 실제로 있는지 봐서 관련성을 판단.
@@ -115,6 +134,11 @@ ISSUE_CATEGORY_KEYWORDS = {
     "it": TOPICS["platform"]["keywords"] + TOPICS["auth"]["keywords"],
     "security": TOPICS["security"]["keywords"] + TOPICS["regulation"]["keywords"],
 }
+
+
+def approval_issues(question: str) -> list[dict]:
+    """전결 카테고리는 AI 추출 없이 전결기준표·계약업무준칙 규칙으로 항목을 만든다."""
+    return [make_issue("approval", text, area, check) for area, text, check in approval_items(question)]
 
 
 def relevant_issue_categories(text: str) -> list[str]:
@@ -131,13 +155,8 @@ def pick_mock_issues(category_ids: list[str]) -> list[dict]:
     items = []
     for category_id in category_ids:
         pool = MOCK_ISSUES_BY_CATEGORY.get(category_id, [])
-        for text in random.sample(pool, k=min(2, len(pool))):
-            items.append({
-                "id": uuid.uuid4().hex,
-                "text": text,
-                "category_id": category_id,
-                "category_label": CATEGORY_LABELS[category_id],
-            })
+        for area, text, check in random.sample(pool, k=min(2, len(pool))):
+            items.append(make_issue(category_id, text, area, check))
     return items
 
 
@@ -159,11 +178,16 @@ async def extract_issues_real(question: str, reply: str) -> list[dict]:
 - "security": 개인정보보호/정보보안 관련 법·규정 이슈
 - "it": 서비스를 IT적으로 구현할 때 점검해야 할 기술적 이슈
 
+각 이슈는 체크리스트 표의 한 줄이 되므로 다음 세 가지를 채우세요:
+- area: 검토 분야를 2~7글자 명사로 (예: "토큰 관리", "개인정보 암호화")
+- text: "~되었는가?" / "~하였는가?" 로 끝나는 점검 질문 한 문장
+- check: 확인에 필요한 자료·값을 쉼표로 구분한 짧은 명사구 (예: "보관 기간, 저장 위치")
+
 실제로 질문/답변 내용과 관련이 있는 이슈만 뽑으세요. 억지로 채우지 말고, 어느 한
 카테고리에 해당하는 이슈가 없으면 그 카테고리는 아예 비워두세요(둘 다 없으면 빈 배열도 가능).
 
 아래 JSON 형식으로만 응답하세요:
-{{"items": [{{"text": "이슈 설명", "category_id": "security 또는 it"}}]}}"""
+{{"items": [{{"area": "검토 분야", "text": "점검 질문", "check": "확인 필요사항", "category_id": "security 또는 it"}}]}}"""
 
     try:
         resp = client.messages.create(
@@ -173,13 +197,8 @@ async def extract_issues_real(question: str, reply: str) -> list[dict]:
         match = re.search(r'\{.*\}', resp.content[0].text, re.DOTALL)
         raw_items = json.loads(match.group()).get("items", []) if match else []
         return [
-            {
-                "id": uuid.uuid4().hex,
-                "text": it["text"],
-                "category_id": it["category_id"],
-                "category_label": CATEGORY_LABELS.get(it["category_id"], it["category_id"]),
-            }
-            for it in raw_items if it.get("category_id") in CATEGORY_LABELS and it.get("text")
+            make_issue(it["category_id"], it["text"], it.get("area", ""), it.get("check", ""))
+            for it in raw_items if it.get("category_id") in AI_EXTRACTED_CATEGORIES and it.get("text")
         ]
     except Exception:
         return []
@@ -270,6 +289,9 @@ async def mock_agent_stream(question: str):
     reply = "\n\n".join(random.choice(MOCK_RESPONSES[t]) for t in topics)
     if law_context:
         reply = law_context + "\n\n---\n\n" + reply
+    approval_text = approval_summary(question)
+    if approval_text:
+        reply += "\n\n---\n\n" + approval_text
 
     for char in reply:
         yield f"data: {json.dumps({'type': 'text', 'text': char})}\n\n"
@@ -278,7 +300,7 @@ async def mock_agent_stream(question: str):
     yield f"data: {json.dumps({'type': 'answer_done'})}\n\n"
 
     relevant = relevant_issue_categories(question)
-    issues = pick_mock_issues(relevant)
+    issues = pick_mock_issues(relevant) + approval_issues(question)
     await asyncio.sleep(0.3)
     yield f"data: {json.dumps({'type': 'issue_suggestion', 'items': issues, 'checked_categories': list(CATEGORY_LABELS.keys())})}\n\n"
 
@@ -305,6 +327,13 @@ async def real_agent_stream(messages: list[dict], model: str):
             + law_context
         )
 
+    approval_text = approval_summary(last_question)
+    if approval_text:
+        system_prompt += (
+            "\n\n다음은 사내 전결기준표·계약업무준칙에 따라 규칙으로 판단한 결과입니다. "
+            "금액·전결권자는 이 내용을 그대로 따르고 답변 끝에 요약해 주세요:\n\n" + approval_text
+        )
+
     yield f"data: {json.dumps({'type': 'answer_start'})}\n\n"
 
     collected = []
@@ -322,7 +351,7 @@ async def real_agent_stream(messages: list[dict], model: str):
     yield f"data: {json.dumps({'type': 'answer_done'})}\n\n"
 
     reply = "".join(collected)
-    issues = await extract_issues_real(last_question, reply)
+    issues = await extract_issues_real(last_question, reply) + approval_issues(last_question)
     yield f"data: {json.dumps({'type': 'issue_suggestion', 'items': issues, 'checked_categories': list(CATEGORY_LABELS.keys())})}\n\n"
 
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -342,10 +371,23 @@ async def agent_chat(request: ChatRequest):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+class OwnerIn(BaseModel):
+    emp_no: str
+    name: str
+    dept: str = ""
+    team: str = ""
+    title: str = ""
+    duty: str = ""
+
+
 class ChecklistItemIn(BaseModel):
     id: str
     text: str
     done: bool = False
+    no: str = ""
+    area: str = ""
+    check: str = ""
+    owner: OwnerIn | None = None
 
 
 class ChecklistCategoryIn(BaseModel):
@@ -360,25 +402,23 @@ class ChecklistExportRequest(BaseModel):
 
 @app.post("/export-checklist")
 async def export_checklist(request: ChecklistExportRequest):
-    doc = Document()
-    doc.add_heading("IT 프로젝트 검토 체크리스트", level=1)
-
-    for category in request.categories:
-        if not category.items:
-            continue
-        doc.add_heading(category.title, level=2)
-        for item in category.items:
-            mark = "☑" if item.done else "☐"
-            doc.add_paragraph(f"{mark}  {item.text}")
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
+    content = build_checklist_docx([c.model_dump() for c in request.categories])
     return Response(
-        content=buf.read(),
+        content=content,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": "attachment; filename=checklist.docx"},
     )
+
+
+class AssignOwnerRequest(BaseModel):
+    text: str
+    category_id: str
+
+
+@app.post("/assign-owner")
+async def assign_owner_endpoint(request: AssignOwnerRequest):
+    """체크리스트에 직접 추가한 항목의 검토 분야와 담당자를 인사파일 기준으로 판단."""
+    return {"area": infer_area(request.text), **assign_owner(request.text, request.category_id)}
 
 
 @app.get("/health")
@@ -389,5 +429,6 @@ async def health():
         "mode": "mock" if USE_MOCK else "claude",
         "topics": list(TOPICS.keys()),
         "law_api_oc": bool(os.getenv("LAW_API_OC")),
+        "employees": len(EMPLOYEES),
         "law_mock_articles": law_summary,
     }
