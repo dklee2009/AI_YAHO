@@ -14,6 +14,11 @@ from law_scraper import find_relevant_articles, get_law_summary
 from owner_matcher import EMPLOYEES, assign_owner, infer_area
 from checklist_docx import build_checklist_docx
 from approval_rules import approval_brief, approval_items, approval_summary
+from risk_review import ai_risks, keyword_risks, risk_area, sort_risks
+from basis_refs import item_basis
+from deliverables import item_plan
+from profiling import ai_profile, keyword_profile, profile_prompt, profile_rule_text
+from timeline import build_timeline
 
 load_dotenv()
 
@@ -57,6 +62,7 @@ TOPICS = {
 
 ASSISTANT_SYSTEM_PROMPT = """당신은 NH농협은행 IT본부의 AI 어시스턴트입니다.
 사용자가 제시하는 IT 프로젝트나 서비스 아이디어를 플랫폼·보안·규정·인증 관점에서 검토합니다.
+개인정보·외부 API·해외 전송·취약점 리스크는 답변 뒤에 별도로 판단하므로 답변에서 길게 다루지 않습니다.
 
 답변은 핵심 요약만 짧게 작성하세요:
 - 첫 줄은 "**핵심 요약**"
@@ -105,6 +111,7 @@ CATEGORY_LABELS = {
     "security": "보안 (개인정보보호·정보보안 법/규정)",
     "it": "IT (서비스 구현 체크리스트)",
     "approval": "전결 (전결기준표·계약업무준칙)",
+    "risk": "리스크 (개인정보·외부API·해외전송·취약점)",
 }
 
 AI_EXTRACTED_CATEGORIES = {"security", "it"}
@@ -131,18 +138,23 @@ MOCK_ISSUES_BY_CATEGORY = {
 }
 
 
-def make_issue(category_id: str, text: str, area: str = "", check: str = "") -> dict:
-    """체크리스트 한 줄 데이터를 만들고 인사파일 기준으로 담당자를 붙인다."""
+def make_issue(category_id: str, text: str, area: str = "", check: str = "", **extra) -> dict:
+    """체크리스트 한 줄 데이터를 만들고 인사파일 기준으로 담당자를 붙인다.
+    extra는 카테고리 고유 필드(리스크의 level·reason 등)를 그대로 싣는다."""
     matched = assign_owner(f"{text} {check}", category_id, area)
+    area = area or infer_area(text)
     return {
+        **extra,
         "id": uuid.uuid4().hex,
         "text": text,
-        "area": area or infer_area(text),
+        "area": area,
         "check": check,
         "category_id": category_id,
         "category_label": CATEGORY_LABELS.get(category_id, category_id),
         "owner": matched["owner"],
         "candidates": matched["candidates"],
+        "basis": item_basis(category_id, area, text, check),
+        **item_plan(category_id, area, text, check),  # phase(처리 단계)·deliverables(필요 산출물)
     }
 
 
@@ -157,6 +169,15 @@ ISSUE_CATEGORY_KEYWORDS = {
 def approval_issues(question: str) -> list[dict]:
     """전결 카테고리는 AI 추출 없이 전결기준표·계약업무준칙 규칙으로 항목을 만든다."""
     return [make_issue("approval", text, area, check) for area, text, check in approval_items(question)]
+
+
+def risk_issues(risks: list[dict]) -> list[dict]:
+    """리스크 판단 결과를 위험도 순으로 체크리스트 항목으로 바꾼다."""
+    return [
+        make_issue("risk", r["text"], risk_area(r["type"]), r["check"],
+                   level=r["level"], reason=r["reason"])
+        for r in sort_risks(risks)
+    ]
 
 
 def relevant_issue_categories(text: str) -> list[str]:
@@ -227,9 +248,27 @@ class Message(BaseModel):
     content: str
 
 
+class ProfileItem(BaseModel):
+    id: str = ""
+    area: str
+    label: str
+    value: str
+    source: str = "answered"  # "inferred"(질문에서 추론) | "answered"(사용자 응답)
+    reason: str = ""
+
+
+class Profile(BaseModel):
+    project_name: str
+    start_date: str = ""  # YYYY-MM-DD, 프로젝트 시작일
+    end_date: str = ""    # YYYY-MM-DD, 프로젝트 종료(오픈)일
+    items: list[ProfileItem] = []
+
+
 class ChatRequest(BaseModel):
     messages: list[Message]
     model: str = "claude-sonnet-5"
+    # 첫 질문 뒤 프로파일 카드에서 받은 프로젝트 기본 정보. 없으면 먼저 프로파일링을 요청한다.
+    profile: Profile | None = None
 
 
 def keyword_route(text: str) -> list[str]:
@@ -290,8 +329,23 @@ async def clarify_stream():
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
-async def mock_agent_stream(question: str):
-    topics = keyword_route(question)
+async def profile_stream(question: str, model: str):
+    """답변 전에 프로젝트명·기본 정보를 묻는 프로파일 카드 데이터를 보낸다."""
+    data = keyword_profile(question) if USE_MOCK else await ai_profile(question, API_KEY, model)
+    await asyncio.sleep(0.3)
+    yield f"data: {json.dumps({'type': 'profile_request', **data})}\n\n"
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
+def with_profile(question: str, profile: dict | None) -> str:
+    """단어 규칙(주제·이슈·리스크·전결)에 쓸 문장: 질문 + 프로파일에서 '해당 있음'인 항목."""
+    extra = profile_rule_text(profile) if profile else ""
+    return f"{question}\n{extra}" if extra else question
+
+
+async def mock_agent_stream(question: str, profile: dict | None = None):
+    rule_q = with_profile(question, profile)
+    topics = keyword_route(rule_q)
 
     # regulation 관련 질문이면 관련 법령 조문 사전 조회
     law_context = ""
@@ -306,7 +360,7 @@ async def mock_agent_stream(question: str):
 
     lines = ["**핵심 요약**"]
     lines += [f"- **{TOPIC_LABELS[t]}** {random.choice(MOCK_SUMMARIES[t])}" for t in topics]
-    extras = [law_brief(law_context), approval_brief(question)]
+    extras = [law_brief(law_context), approval_brief(rule_q)]
     reply = "\n".join(lines) + "".join(f"\n\n{e}" for e in extras if e)
 
     for char in reply:
@@ -315,20 +369,23 @@ async def mock_agent_stream(question: str):
 
     yield f"data: {json.dumps({'type': 'answer_done'})}\n\n"
 
-    relevant = relevant_issue_categories(question)
-    issues = pick_mock_issues(relevant) + approval_issues(question)
+    relevant = relevant_issue_categories(rule_q)
+    issues = pick_mock_issues(relevant) + risk_issues(keyword_risks(rule_q)) + approval_issues(rule_q)
     await asyncio.sleep(0.3)
     yield f"data: {json.dumps({'type': 'issue_suggestion', 'items': issues, 'checked_categories': list(CATEGORY_LABELS.keys())})}\n\n"
 
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
-async def real_agent_stream(messages: list[dict], model: str):
+async def real_agent_stream(messages: list[dict], model: str, profile: dict | None = None):
     import anthropic
     client = anthropic.Anthropic(api_key=API_KEY)
 
     last_question = messages[-1]["content"] if messages else ""
-    topics = keyword_route(last_question)
+    rule_q = with_profile(last_question, profile)
+    # AI 판단(이슈·리스크)에는 '해당 없음'까지 포함한 프로파일 전체를 함께 준다.
+    ai_q = f"{last_question}\n\n[프로젝트 프로파일]\n{profile_prompt(profile)}" if profile else last_question
+    topics = keyword_route(rule_q)
 
     # regulation 관련 질문이면 관련 법령 조문 사전 조회
     law_context = ""
@@ -343,7 +400,13 @@ async def real_agent_stream(messages: list[dict], model: str):
             + law_context
         )
 
-    approval_text = approval_summary(last_question)
+    if profile:
+        system_prompt += (
+            "\n\n다음은 사용자가 확인한 프로젝트 프로파일입니다. 이 정보를 전제로 검토하고 다시 묻지 마세요:\n"
+            + profile_prompt(profile)
+        )
+
+    approval_text = approval_summary(rule_q)
     if approval_text:
         system_prompt += (
             "\n\n다음은 사내 전결기준표·계약업무준칙에 따라 규칙으로 판단한 결과입니다. "
@@ -367,7 +430,11 @@ async def real_agent_stream(messages: list[dict], model: str):
     yield f"data: {json.dumps({'type': 'answer_done'})}\n\n"
 
     reply = "".join(collected)
-    issues = await extract_issues_real(last_question, reply) + approval_issues(last_question)
+    issues = (
+        await extract_issues_real(ai_q, reply)
+        + risk_issues(await ai_risks(ai_q, reply, API_KEY))
+        + approval_issues(rule_q)
+    )
     yield f"data: {json.dumps({'type': 'issue_suggestion', 'items': issues, 'checked_categories': list(CATEGORY_LABELS.keys())})}\n\n"
 
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
@@ -378,10 +445,17 @@ async def agent_chat(request: ChatRequest):
     messages = [{"role": m.role, "content": m.content} for m in request.messages]
     question = messages[-1]["content"] if messages else ""
 
-    if is_first_turn(messages) and not await is_project_question(question):
-        gen = clarify_stream()
+    profile = request.profile.model_dump() if request.profile else None
+
+    # 첫 질문: 프로젝트 질문이 아니면 되묻고, 맞으면 답변 전에 프로파일링부터 한다.
+    # 프로파일 카드를 제출하면 같은 대화로 profile을 실어 다시 호출된다.
+    if profile is None and is_first_turn(messages):
+        if await is_project_question(question):
+            gen = profile_stream(question, request.model)
+        else:
+            gen = clarify_stream()
     else:
-        gen = mock_agent_stream(question) if USE_MOCK else real_agent_stream(messages, request.model)
+        gen = mock_agent_stream(question, profile) if USE_MOCK else real_agent_stream(messages, request.model, profile)
 
     return StreamingResponse(gen, media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -403,6 +477,8 @@ class ChecklistItemIn(BaseModel):
     no: str = ""
     area: str = ""
     check: str = ""
+    level: str = ""
+    reason: str = ""
     owner: OwnerIn | None = None
 
 
@@ -414,16 +490,33 @@ class ChecklistCategoryIn(BaseModel):
 
 class ChecklistExportRequest(BaseModel):
     categories: list[ChecklistCategoryIn]
+    project: Profile | None = None
 
 
 @app.post("/export-checklist")
 async def export_checklist(request: ChecklistExportRequest):
-    content = build_checklist_docx([c.model_dump() for c in request.categories])
+    categories = [c.model_dump() for c in request.categories]
+    for cat in categories:
+        for item in cat["items"]:
+            item["basis"] = item_basis(cat["id"], item["area"], item["text"], item["check"])
+            item.update(item_plan(cat["id"], item["area"], item["text"], item["check"]))
+    project = request.project.model_dump() if request.project else None
+    content = build_checklist_docx(categories, project=project, timeline=build_timeline(project))
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": "attachment; filename=checklist.docx"},
     )
+
+
+class TimelineRequest(BaseModel):
+    profile: Profile
+
+
+@app.post("/timeline")
+async def timeline_endpoint(request: TimelineRequest):
+    """프로젝트 시작·종료일과 프로파일로 단계별 예상 일정을 산출한다. 날짜가 없거나 잘못되면 null."""
+    return {"timeline": build_timeline(request.profile.model_dump())}
 
 
 class AssignOwnerRequest(BaseModel):
@@ -433,8 +526,14 @@ class AssignOwnerRequest(BaseModel):
 
 @app.post("/assign-owner")
 async def assign_owner_endpoint(request: AssignOwnerRequest):
-    """체크리스트에 직접 추가한 항목의 검토 분야와 담당자를 인사파일 기준으로 판단."""
-    return {"area": infer_area(request.text), **assign_owner(request.text, request.category_id)}
+    """체크리스트에 직접 추가한 항목의 검토 분야·담당자(인사파일 기준)·근거 규정·처리 단계·필요 산출물을 판단."""
+    area = infer_area(request.text)
+    return {
+        "area": area,
+        **assign_owner(request.text, request.category_id),
+        "basis": item_basis(request.category_id, area, request.text, ""),
+        **item_plan(request.category_id, area, request.text, ""),
+    }
 
 
 @app.get("/health")
