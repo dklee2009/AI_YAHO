@@ -677,14 +677,33 @@ export default function App() {
   const [panelTab, setPanelTab] = useState("checklist"); // "checklist" | "preview"
   const nextConvId = useRef(2);
   const bottomRef = useRef(null);
+  const chatAreaRef = useRef(null);
   const textareaRef = useRef(null);
 
   const activeConv = conversations.find(c => c.id === activeId);
 
+  // 새 질문(또는 프로파일 제출 후 새 답변)이 추가될 때만 한 번 스크롤해, 그 질문이 화면 맨 위에
+  // 오도록 한다. 스트리밍 중 글자가 늘어날 때는 따라 내리지 않으므로 답변을 처음부터 읽을 수 있다.
+  // 대화를 바꾼 경우에는 그 대화의 메시지 수를 기준으로 다시 잡아, 전환만으로 스크롤되지 않게 한다.
+  const prevMsgCount = useRef(0);
+  const prevScrollConvId = useRef(activeId);
   useEffect(() => {
-    // 빈 대화(홈 화면)에서는 내리지 않는다 — 화면이 작으면 상단 안내가 가려진다.
-    if (activeConv?.messages.length) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [activeConv?.messages]);
+    const msgs = activeConv?.messages ?? [];
+    const prevCount = prevMsgCount.current;
+    const switched = prevScrollConvId.current !== activeId;
+    prevMsgCount.current = msgs.length;
+    prevScrollConvId.current = activeId;
+    if (switched || msgs.length <= prevCount) return;
+    const area = chatAreaRef.current;
+    if (!area) return;
+    const added = msgs.slice(prevCount);
+    const target = added.some(m => m.type === "user")
+      ? [...area.querySelectorAll(".msg-user")].pop()
+      : area.lastElementChild?.previousElementSibling; // 맨 끝은 bottomRef 자리표시
+    if (!target) return;
+    const top = area.scrollTop + target.getBoundingClientRect().top - area.getBoundingClientRect().top - 16;
+    area.scrollTo({ top, behavior: "smooth" });
+  }, [activeConv?.messages, activeId]);
 
   // 대화를 바꾸거나 새 대화를 열면(삭제로 다른 대화로 넘어간 경우 포함) 이전 대화의
   // 체크리스트·문서 미리보기가 떠 있지 않도록 패널을 닫는다. 첫 화면에서는 닫지 않는다.
@@ -1046,7 +1065,7 @@ export default function App() {
           </button>
         </header>
 
-        <main className="chat-area">
+        <main className="chat-area" ref={chatAreaRef}>
           {activeConv?.messages.length === 0 ? (
             <div className="empty-state">
               <div className="empty-icon"><SparkIcon size={28} /></div>
